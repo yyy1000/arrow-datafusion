@@ -26,9 +26,11 @@ use datafusion::{
 
 use datafusion::error::Result;
 use datafusion::prelude::*;
-use datafusion_common::{internal_err, DataFusionError, DFSchema, ExprSchema, ScalarValue};
+use datafusion_common::{
+    not_impl_err, plan_err, DFSchema, DataFusionError, ExprSchema, ScalarValue,
+};
 use datafusion_expr::{
-    ColumnarValue, ExprSchemable, ScalarFunctionImplementation, ScalarUDF, ScalarUDFImpl, Signature
+    ColumnarValue, ExprSchemable, ScalarUDF, ScalarUDFImpl, Signature,
 };
 use std::{any::Any, sync::Arc};
 
@@ -59,11 +61,11 @@ fn create_context() -> Result<SessionContext> {
 }
 
 #[derive(Debug)]
-struct UDFWithExprReturn {
+struct TakeUDF {
     signature: Signature,
 }
 
-impl UDFWithExprReturn {
+impl TakeUDF {
     fn new() -> Self {
         Self {
             signature: Signature::any(3, Volatility::Immutable),
@@ -72,39 +74,53 @@ impl UDFWithExprReturn {
 }
 
 //Implement the ScalarUDFImpl trait for UDFWithExprReturn
-impl ScalarUDFImpl for UDFWithExprReturn {
+impl ScalarUDFImpl for TakeUDF {
     fn as_any(&self) -> &dyn Any {
         self
     }
     fn name(&self) -> &str {
-        "my_cast"
+        "tale"
     }
     fn signature(&self) -> &Signature {
         &self.signature
     }
     fn return_type(&self, args: &[DataType]) -> Result<DataType> {
-        Ok(DataType::Float32)
+        not_impl_err!("Not called because the return_type_from_exprs is implemented")
     }
-    // An example of how to use the exprs to determine the return type
-    // If the third argument is '0', return the type of the first argument
-    // If the third argument is '1', return the type of the second argument
+
+    /// Thus function returns the type of the first or second argument based on
+    /// the third argument:
+    ///
+    /// 1. If the third argument is '0', return the type of the first argument
+    /// 2. If the third argument is '1', return the type of the second argument
     fn return_type_from_exprs(
         &self,
         arg_exprs: &[Expr],
         schema: &DFSchema,
-    ) -> Option<Result<DataType>> {
+    ) -> Result<DataType> {
         if arg_exprs.len() != 3 {
-            return Some(internal_err!("The size of the args must be 3."));
+            return plan_err!("Expected 3 arguments, got {}.", arg_exprs.len());
         }
-        let take_idx = match arg_exprs.get(2).unwrap() {
-            Expr::Literal(ScalarValue::Int64(Some(idx))) if (idx == &0 || idx == &1) => {
+
+        let take_idx = if let Some(Expr::Literal(ScalarValue::Int64(Some(idx)))) =
+            arg_exprs.get(2)
+        {
+            if *idx == 0 || *idx == 1 {
                 *idx as usize
+            } else {
+                return plan_err!("The third argument must be 0 or 1, got: {idx}");
             }
-            _ => unreachable!(),
+        } else {
+            return plan_err!(
+                "The third argument must be a literal of type int64, but got {:?}",
+                arg_exprs.get(2)
+            );
         };
-        Some(arg_exprs.get(take_idx).unwrap().get_type(schema))
+
+        arg_exprs.get(take_idx).unwrap().get_type(schema)
     }
-    // The actual implementation would add one to the argument
+
+    // The actual implementation rethr
     fn invoke(&self, args: &[ColumnarValue]) -> Result<ColumnarValue> {
         let take_idx = match &args[2] {
             ColumnarValue::Scalar(ScalarValue::Int64(Some(v))) if v < &2 => *v as usize,
@@ -117,34 +133,29 @@ impl ScalarUDFImpl for UDFWithExprReturn {
     }
 }
 
-
-
 #[tokio::main]
 async fn main() -> Result<()> {
     // Create a new ScalarUDF from the implementation
-    let udf_with_expr_return = ScalarUDF::from(UDFWithExprReturn::new());
+    let take = ScalarUDF::from(TakeUDF::new());
 
-    let ctx = create_context()?;
+    // SELECT take(a, b, 1) AS take0, take(a, b, 0) AS take1 FROM t;
+    let expr0 = take.call(vec![col("a"), col("b"), lit(1_i64)]);
+    let expr1 = take.call(vec![col("a"), col("b"), lit(0_i64)]);
 
-    ctx.register_udf(udf_with_expr_return);
+    let df = create_context()?
+        .table("t")
+        .await?
+        .select(vec![expr0, expr1])?;
 
-    // SELECT take(a, b, 0) AS take0, take(a, b, 1) AS take1 FROM t;
-    let df = ctx.table("t").await?;
-    let take = df.registry().udf("my_cast")?;
-    let expr0 = take
-        .call(vec![col("a"), col("b"), lit(0_i64)]);
-    let expr1 = take
-        .call(vec![col("a"), col("b"), lit(1_i64)]);
-
-    let df = df.select(vec![expr0, expr1])?;
     let schema = df.schema();
 
-    // Check output schema
-    assert_eq!(schema.field(0).data_type(), &DataType::Float32);
-    assert_eq!(schema.field(1).data_type(), &DataType::Float64);
+    // The output schema should be
+    // * type of column b (float64)
+    // * type of column a (float32)
+    assert_eq!(schema.field(0).data_type(), &DataType::Float64);
+    assert_eq!(schema.field(1).data_type(), &DataType::Float32);
 
     df.show().await?;
-    
 
     Ok(())
 }

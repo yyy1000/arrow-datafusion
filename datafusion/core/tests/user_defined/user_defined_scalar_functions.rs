@@ -517,7 +517,7 @@ impl ScalarUDFImpl for TakeUDF {
         self
     }
     fn name(&self) -> &str {
-        "tale"
+        "take"
     }
     fn signature(&self) -> &Signature {
         &self.signature
